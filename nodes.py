@@ -14,6 +14,7 @@ from .inference.configuration_sec import SeCConfig
 from .inference.modeling_sec import SeCModel
 from transformers import AutoTokenizer
 from pathlib import Path
+from dist_utils import args, tensor_chunk, all_gather, all_all, all_all_async, conv3d_p2pop, conv2d_p2pop, tensor_boradcast, tensor_chunk_send
 
 # Debug logging control - disabled by default, enable with SEC_DEBUG=true environment variable
 DEBUG_SEC = os.getenv("SEC_DEBUG", "false").lower() == "true"
@@ -246,7 +247,7 @@ class SeCModelLoader:
         print(f"Loading SeC model: {os.path.basename(model_path) if is_single_file else 'SeC-4B (sharded)'} [{precision_str.upper()}]")
 
         if device == "auto":
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            device = f"cuda:{args.rank}" if torch.cuda.is_available() else "cpu"
         elif device.startswith("gpu"):
             try:
                 gpu_num = int(device[3:])
