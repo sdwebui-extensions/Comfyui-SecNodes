@@ -1070,147 +1070,189 @@ class SeCVideoSegmentation:
 
         video_dir = None  # Track for cleanup
         try:
-            if (args.rank == 0) or (args.world_size < 2):
-                pil_images = self.tensor_to_pil_images(frames)
-                video_dir, frame_paths = self.save_frames_temporarily(pil_images)
-                if max_frames_to_track == -1:
-                    max_frames_to_track = len(pil_images)
-                num_frames = len(pil_images)
-                del pil_images
+            pil_images = self.tensor_to_pil_images(frames)
+            video_dir, frame_paths = self.save_frames_temporarily(pil_images)
+            if max_frames_to_track == -1:
+                max_frames_to_track = len(pil_images)
+            num_frames = len(pil_images)
+            del pil_images
 
-                # Automatically set offload_state_to_cpu based on model device
-                try:
-                    offload_state_to_cpu = str(model.device) == "cpu"
-                except AttributeError:
-                    # Fallback if model doesn't have device attribute
-                    offload_state_to_cpu = False
+            # Automatically set offload_state_to_cpu based on model device
+            try:
+                offload_state_to_cpu = str(model.device) == "cpu"
+            except AttributeError:
+                # Fallback if model doesn't have device attribute
+                offload_state_to_cpu = False
 
-                inference_state = model.grounding_encoder.init_state(
-                    video_path=video_dir,
-                    offload_video_to_cpu=offload_video_to_cpu,
-                    offload_state_to_cpu=offload_state_to_cpu
+            inference_state = model.grounding_encoder.init_state(
+                video_path=video_dir,
+                offload_video_to_cpu=offload_video_to_cpu,
+                offload_state_to_cpu=offload_state_to_cpu
+            )
+            model.grounding_encoder.reset_state(inference_state)
+
+            # Parse inputs with bounds checking
+            pos_points, pos_labels, pos_errors = self.parse_points(positive_points, frames.shape)
+            neg_points, neg_labels, neg_errors = self.parse_points(negative_points, frames.shape)
+            bbox_coords = self.parse_bbox(bbox)
+
+            # Collect validation errors for better error messages
+            all_validation_errors = []
+            if pos_errors:
+                all_validation_errors.extend([f"Positive {err}" for err in pos_errors])
+            if neg_errors:
+                all_validation_errors.extend([f"Negative {err}" for err in neg_errors])
+
+            init_mask = None
+
+            # Step 1: Add mask if provided (establishes initial region)
+            if input_mask is not None:
+                # Handle both [H, W] and [B, H, W] mask formats
+                if input_mask.dim() == 2:
+                    mask_array = input_mask.cpu().numpy()
+                elif input_mask.dim() == 3:
+                    mask_array = input_mask[0].cpu().numpy()
+                else:
+                    raise ValueError(f"Unexpected mask dimensions: {input_mask.dim()}. Expected 2D [H,W] or 3D [B,H,W]")
+
+                init_mask = (mask_array > 0.5).astype(np.bool_)
+
+                _, out_obj_ids, out_mask_logits = model.grounding_encoder.add_new_mask(
+                    inference_state=inference_state,
+                    frame_idx=annotation_frame_idx,
+                    obj_id=object_id,
+                    mask=init_mask,
                 )
+
+            # Step 2: Filter positive points if mask was provided
+            # Only keep positive points that fall inside the mask boundary
+            if init_mask is not None and pos_points is not None:
+                filtered_pos_points = []
+                filtered_pos_labels = []
+                for i, point in enumerate(pos_points):
+                    x, y = int(point[0]), int(point[1])
+                    # Check if point is within mask bounds and inside the mask
+                    if 0 <= y < init_mask.shape[0] and 0 <= x < init_mask.shape[1]:
+                        if init_mask[y, x]:  # Point is inside mask
+                            filtered_pos_points.append(point)
+                            filtered_pos_labels.append(pos_labels[i])
+
+                # Replace pos_points with filtered version
+                if filtered_pos_points:
+                    pos_points = np.array(filtered_pos_points)
+                    pos_labels = np.array(filtered_pos_labels, dtype=np.int32)
+                else:
+                    # No positive points inside mask - clear them
+                    pos_points = None
+                    pos_labels = None
+
+            # Step 2b: Warn about negative points when mask is provided
+            # Negative points should ideally be inside or near the mask to refine segmentation
+            if init_mask is not None and neg_points is not None:
+                # Find pixels in the mask
+                mask_pixels = np.argwhere(init_mask)
+                if len(mask_pixels) > 0:
+                    points_outside = []
+                    for i, point in enumerate(neg_points):
+                        x, y = int(point[0]), int(point[1])
+                        # Calculate minimum distance to any mask pixel
+                        distances = np.sqrt(((mask_pixels[:, 0] - y) ** 2) + ((mask_pixels[:, 1] - x) ** 2))
+                        min_dist = distances.min()
+
+                        # If point is >50 pixels away from mask, warn
+                        if min_dist > 50:
+                            points_outside.append((i, min_dist))
+
+                    if points_outside:
+                        print(f"  Warning: {len(points_outside)} negative point(s) are far from the mask region.")
+                        print(f"  Negative points work best inside or near the masked object to refine segmentation.")
+                        print(f"  Points far outside the mask may cause unexpected results or empty segmentation.")
+
+            # Step 3: Combine points for refinement
+            points = None
+            labels = None
+            if pos_points is not None and neg_points is not None:
+                points = np.concatenate([pos_points, neg_points], axis=0)
+                labels = np.concatenate([pos_labels, np.zeros(len(neg_points), dtype=np.int32)], axis=0)
+            elif pos_points is not None:
+                points = pos_points
+                labels = pos_labels
+            elif neg_points is not None:
+                points = neg_points
+                labels = np.zeros(len(neg_points), dtype=np.int32)
+
+            # Step 4: Handle bbox + points combination properly
+            # If both bbox and points are provided, we need to:
+            # 1. First establish initial mask using bbox only
+            # 2. Then refine with points
+            if bbox_coords is not None and points is not None:
+                # First: Use bbox to create initial segmentation
+                _, out_obj_ids, out_mask_logits = model.grounding_encoder.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=annotation_frame_idx,
+                    obj_id=object_id,
+                    points=None,
+                    labels=None,
+                    box=bbox_coords,
+                )
+                init_mask = (out_mask_logits[0] > 0.0).cpu().numpy()
+
+                # Then: Refine with points
+                _, out_obj_ids, out_mask_logits = model.grounding_encoder.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=annotation_frame_idx,
+                    obj_id=object_id,
+                    points=points,
+                    labels=labels,
+                    box=None,
+                )
+                init_mask = (out_mask_logits[0] > 0.0).cpu().numpy()
+
+            # Step 4b: Handle bbox OR points (not both)
+            elif points is not None or bbox_coords is not None:
+                _, out_obj_ids, out_mask_logits = model.grounding_encoder.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=annotation_frame_idx,
+                    obj_id=object_id,
+                    points=points,
+                    labels=labels if points is not None else None,
+                    box=bbox_coords,
+                )
+                init_mask = (out_mask_logits[0] > 0.0).cpu().numpy()
+
+            # Ensure at least one input was provided
+            if init_mask is None:
+                error_msg = "At least one visual prompt (points, bbox, or mask) must be provided."
+                if all_validation_errors:
+                    error_msg += f" Point validation failures: {'; '.join(all_validation_errors)}"
+                raise ValueError(error_msg)
+
+
+            # Pre-allocate output tensor and object IDs list (Phase 3 optimization)
+            # Eliminates video_segments dictionary accumulation (~110-150MB for 150 frames)
+            # and the 500MB VRAM spike from copying dict → GPU tensor
+            masks_tensor = torch.zeros(num_frames, frames.shape[1], frames.shape[2], dtype=torch.float32)
+            output_obj_ids = [0] * num_frames
+
+            if tracking_direction == "bidirectional":
+                for out_frame_idx, out_obj_ids, out_mask_logits in model.propagate_in_video(
+                    inference_state,
+                    start_frame_idx=annotation_frame_idx,
+                    max_frame_num_to_track=max_frames_to_track,
+                    reverse=False,
+                    init_mask=init_mask,
+                    mllm_memory_size=mllm_memory_size,
+                ):
+                    # Write directly to pre-allocated tensor (Phase 3)
+                    for i, out_obj_id in enumerate(out_obj_ids):
+                        mask = (out_mask_logits[i] > 0.0).cpu()
+                        masks_tensor[out_frame_idx] = mask.float()
+                        output_obj_ids[out_frame_idx] = out_obj_id
+                        break  # Only handle first object per frame
+
                 model.grounding_encoder.reset_state(inference_state)
 
-                # Parse inputs with bounds checking
-                pos_points, pos_labels, pos_errors = self.parse_points(positive_points, frames.shape)
-                neg_points, neg_labels, neg_errors = self.parse_points(negative_points, frames.shape)
-                bbox_coords = self.parse_bbox(bbox)
-
-                # Collect validation errors for better error messages
-                all_validation_errors = []
-                if pos_errors:
-                    all_validation_errors.extend([f"Positive {err}" for err in pos_errors])
-                if neg_errors:
-                    all_validation_errors.extend([f"Negative {err}" for err in neg_errors])
-
-                init_mask = None
-
-                # Step 1: Add mask if provided (establishes initial region)
-                if input_mask is not None:
-                    # Handle both [H, W] and [B, H, W] mask formats
-                    if input_mask.dim() == 2:
-                        mask_array = input_mask.cpu().numpy()
-                    elif input_mask.dim() == 3:
-                        mask_array = input_mask[0].cpu().numpy()
-                    else:
-                        raise ValueError(f"Unexpected mask dimensions: {input_mask.dim()}. Expected 2D [H,W] or 3D [B,H,W]")
-
-                    init_mask = (mask_array > 0.5).astype(np.bool_)
-
-                    _, out_obj_ids, out_mask_logits = model.grounding_encoder.add_new_mask(
-                        inference_state=inference_state,
-                        frame_idx=annotation_frame_idx,
-                        obj_id=object_id,
-                        mask=init_mask,
-                    )
-
-                # Step 2: Filter positive points if mask was provided
-                # Only keep positive points that fall inside the mask boundary
-                if init_mask is not None and pos_points is not None:
-                    filtered_pos_points = []
-                    filtered_pos_labels = []
-                    for i, point in enumerate(pos_points):
-                        x, y = int(point[0]), int(point[1])
-                        # Check if point is within mask bounds and inside the mask
-                        if 0 <= y < init_mask.shape[0] and 0 <= x < init_mask.shape[1]:
-                            if init_mask[y, x]:  # Point is inside mask
-                                filtered_pos_points.append(point)
-                                filtered_pos_labels.append(pos_labels[i])
-
-                    # Replace pos_points with filtered version
-                    if filtered_pos_points:
-                        pos_points = np.array(filtered_pos_points)
-                        pos_labels = np.array(filtered_pos_labels, dtype=np.int32)
-                    else:
-                        # No positive points inside mask - clear them
-                        pos_points = None
-                        pos_labels = None
-
-                # Step 2b: Warn about negative points when mask is provided
-                # Negative points should ideally be inside or near the mask to refine segmentation
-                if init_mask is not None and neg_points is not None:
-                    # Find pixels in the mask
-                    mask_pixels = np.argwhere(init_mask)
-                    if len(mask_pixels) > 0:
-                        points_outside = []
-                        for i, point in enumerate(neg_points):
-                            x, y = int(point[0]), int(point[1])
-                            # Calculate minimum distance to any mask pixel
-                            distances = np.sqrt(((mask_pixels[:, 0] - y) ** 2) + ((mask_pixels[:, 1] - x) ** 2))
-                            min_dist = distances.min()
-
-                            # If point is >50 pixels away from mask, warn
-                            if min_dist > 50:
-                                points_outside.append((i, min_dist))
-
-                        if points_outside:
-                            print(f"  Warning: {len(points_outside)} negative point(s) are far from the mask region.")
-                            print(f"  Negative points work best inside or near the masked object to refine segmentation.")
-                            print(f"  Points far outside the mask may cause unexpected results or empty segmentation.")
-
-                # Step 3: Combine points for refinement
-                points = None
-                labels = None
-                if pos_points is not None and neg_points is not None:
-                    points = np.concatenate([pos_points, neg_points], axis=0)
-                    labels = np.concatenate([pos_labels, np.zeros(len(neg_points), dtype=np.int32)], axis=0)
-                elif pos_points is not None:
-                    points = pos_points
-                    labels = pos_labels
-                elif neg_points is not None:
-                    points = neg_points
-                    labels = np.zeros(len(neg_points), dtype=np.int32)
-
-                # Step 4: Handle bbox + points combination properly
-                # If both bbox and points are provided, we need to:
-                # 1. First establish initial mask using bbox only
-                # 2. Then refine with points
-                if bbox_coords is not None and points is not None:
-                    # First: Use bbox to create initial segmentation
-                    _, out_obj_ids, out_mask_logits = model.grounding_encoder.add_new_points_or_box(
-                        inference_state=inference_state,
-                        frame_idx=annotation_frame_idx,
-                        obj_id=object_id,
-                        points=None,
-                        labels=None,
-                        box=bbox_coords,
-                    )
-                    init_mask = (out_mask_logits[0] > 0.0).cpu().numpy()
-
-                    # Then: Refine with points
-                    _, out_obj_ids, out_mask_logits = model.grounding_encoder.add_new_points_or_box(
-                        inference_state=inference_state,
-                        frame_idx=annotation_frame_idx,
-                        obj_id=object_id,
-                        points=points,
-                        labels=labels,
-                        box=None,
-                    )
-                    init_mask = (out_mask_logits[0] > 0.0).cpu().numpy()
-
-                # Step 4b: Handle bbox OR points (not both)
-                elif points is not None or bbox_coords is not None:
+                if points is not None or bbox_coords is not None:
                     _, out_obj_ids, out_mask_logits = model.grounding_encoder.add_new_points_or_box(
                         inference_state=inference_state,
                         frame_idx=annotation_frame_idx,
@@ -1219,105 +1261,52 @@ class SeCVideoSegmentation:
                         labels=labels if points is not None else None,
                         box=bbox_coords,
                     )
-                    init_mask = (out_mask_logits[0] > 0.0).cpu().numpy()
+                elif input_mask is not None:
+                    _, out_obj_ids, out_mask_logits = model.grounding_encoder.add_new_mask(
+                        inference_state=inference_state,
+                        frame_idx=annotation_frame_idx,
+                        obj_id=object_id,
+                        mask=init_mask,
+                    )
 
-                # Ensure at least one input was provided
-                if init_mask is None:
-                    error_msg = "At least one visual prompt (points, bbox, or mask) must be provided."
-                    if all_validation_errors:
-                        error_msg += f" Point validation failures: {'; '.join(all_validation_errors)}"
-                    raise ValueError(error_msg)
-
-
-                # Pre-allocate output tensor and object IDs list (Phase 3 optimization)
-                # Eliminates video_segments dictionary accumulation (~110-150MB for 150 frames)
-                # and the 500MB VRAM spike from copying dict → GPU tensor
-                masks_tensor = torch.zeros(num_frames, frames.shape[1], frames.shape[2], dtype=torch.float32)
-                output_obj_ids = [0] * num_frames
-
-                if tracking_direction == "bidirectional":
-                    for out_frame_idx, out_obj_ids, out_mask_logits in model.propagate_in_video(
-                        inference_state,
-                        start_frame_idx=annotation_frame_idx,
-                        max_frame_num_to_track=max_frames_to_track,
-                        reverse=False,
-                        init_mask=init_mask,
-                        mllm_memory_size=mllm_memory_size,
-                    ):
-                        # Write directly to pre-allocated tensor (Phase 3)
+                for out_frame_idx, out_obj_ids, out_mask_logits in model.propagate_in_video(
+                    inference_state,
+                    start_frame_idx=annotation_frame_idx,
+                    max_frame_num_to_track=max_frames_to_track,
+                    reverse=True,
+                    init_mask=init_mask,
+                    mllm_memory_size=mllm_memory_size,
+                ):
+                    # Write directly to pre-allocated tensor if not already written (Phase 3)
+                    # Check if frame was already processed in forward pass
+                    if output_obj_ids[out_frame_idx] == 0:
                         for i, out_obj_id in enumerate(out_obj_ids):
                             mask = (out_mask_logits[i] > 0.0).cpu()
                             masks_tensor[out_frame_idx] = mask.float()
                             output_obj_ids[out_frame_idx] = out_obj_id
                             break  # Only handle first object per frame
+            else:
+                reverse = (tracking_direction == "backward")
+                for out_frame_idx, out_obj_ids, out_mask_logits in model.propagate_in_video(
+                    inference_state,
+                    start_frame_idx=annotation_frame_idx,
+                    max_frame_num_to_track=max_frames_to_track,
+                    reverse=reverse,
+                    init_mask=init_mask,
+                    mllm_memory_size=mllm_memory_size,
+                ):
+                    # Write directly to pre-allocated tensor (Phase 3)
+                    for i, out_obj_id in enumerate(out_obj_ids):
+                        mask = (out_mask_logits[i] > 0.0).cpu()
+                        masks_tensor[out_frame_idx] = mask.float()
+                        output_obj_ids[out_frame_idx] = out_obj_id
+                        break  # Only handle first object per frame
 
-                    model.grounding_encoder.reset_state(inference_state)
-
-                    if points is not None or bbox_coords is not None:
-                        _, out_obj_ids, out_mask_logits = model.grounding_encoder.add_new_points_or_box(
-                            inference_state=inference_state,
-                            frame_idx=annotation_frame_idx,
-                            obj_id=object_id,
-                            points=points,
-                            labels=labels if points is not None else None,
-                            box=bbox_coords,
-                        )
-                    elif input_mask is not None:
-                        _, out_obj_ids, out_mask_logits = model.grounding_encoder.add_new_mask(
-                            inference_state=inference_state,
-                            frame_idx=annotation_frame_idx,
-                            obj_id=object_id,
-                            mask=init_mask,
-                        )
-
-                    for out_frame_idx, out_obj_ids, out_mask_logits in model.propagate_in_video(
-                        inference_state,
-                        start_frame_idx=annotation_frame_idx,
-                        max_frame_num_to_track=max_frames_to_track,
-                        reverse=True,
-                        init_mask=init_mask,
-                        mllm_memory_size=mllm_memory_size,
-                    ):
-                        # Write directly to pre-allocated tensor if not already written (Phase 3)
-                        # Check if frame was already processed in forward pass
-                        if output_obj_ids[out_frame_idx] == 0:
-                            for i, out_obj_id in enumerate(out_obj_ids):
-                                mask = (out_mask_logits[i] > 0.0).cpu()
-                                masks_tensor[out_frame_idx] = mask.float()
-                                output_obj_ids[out_frame_idx] = out_obj_id
-                                break  # Only handle first object per frame
-                else:
-                    reverse = (tracking_direction == "backward")
-                    for out_frame_idx, out_obj_ids, out_mask_logits in model.propagate_in_video(
-                        inference_state,
-                        start_frame_idx=annotation_frame_idx,
-                        max_frame_num_to_track=max_frames_to_track,
-                        reverse=reverse,
-                        init_mask=init_mask,
-                        mllm_memory_size=mllm_memory_size,
-                    ):
-                        # Write directly to pre-allocated tensor (Phase 3)
-                        for i, out_obj_id in enumerate(out_obj_ids):
-                            mask = (out_mask_logits[i] > 0.0).cpu()
-                            masks_tensor[out_frame_idx] = mask.float()
-                            output_obj_ids[out_frame_idx] = out_obj_id
-                            break  # Only handle first object per frame
-
-                # Convert output_obj_ids list to tensor
-                obj_ids_tensor = torch.tensor(output_obj_ids, dtype=torch.int32)
-                if args.world_size > 1:
-                    torch.save(masks_tensor, "masks_file.pth")
-                    torch.save(obj_ids_tensor, "obj_ids_tensor")
+            # Convert output_obj_ids list to tensor
+            obj_ids_tensor = torch.tensor(output_obj_ids, dtype=torch.int32)
 
             if args.world_size > 1:
                 torch.distributed.barrier()
-                if args.rank > 0:
-                    masks_tensor = torch.load("masks_file.pth")
-                    obj_ids_tensor = torch.load("obj_ids_tensor")
-                torch.distributed.barrier()
-                if args.rank == 0:
-                    os.remove("masks_file.pth")
-                    os.remove("obj_ids_tensor")
 
             return (masks_tensor, obj_ids_tensor)
 
