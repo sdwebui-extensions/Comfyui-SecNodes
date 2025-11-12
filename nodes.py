@@ -1021,6 +1021,9 @@ class SeCVideoSegmentation:
                      annotation_frame_idx=0, object_id=1, max_frames_to_track=-1, mllm_memory_size=12,
                      offload_video_to_cpu=False, auto_unload_model=True):
         """Perform video object segmentation"""
+        if args.world_size > 1 and args.only_sampler:
+            if args.rank>0:
+                annotation_frame_idx = min(annotation_frame_idx, frames.shape[0] - 1)
 
         # === Model State Validation and Auto-Reload ===
         # Check if model has been unloaded and reload if necessary
