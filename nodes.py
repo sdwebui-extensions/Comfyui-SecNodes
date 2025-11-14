@@ -1308,8 +1308,6 @@ class SeCVideoSegmentation:
             # Convert output_obj_ids list to tensor
             obj_ids_tensor = torch.tensor(output_obj_ids, dtype=torch.int32)
 
-            if args.world_size > 1:
-                torch.distributed.barrier()
 
             return (masks_tensor, obj_ids_tensor)
 
